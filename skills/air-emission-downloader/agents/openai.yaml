@@ -1,0 +1,6 @@
+interface:
+  display_name: "Air Emission Downloader"
+  short_description: "Retrieve air-emission reports by region or company."
+  default_prompt: "使用 $air-emission-downloader，根据我的指令选择按地区或按企业获取JJA大气排污记录，先核对范围和身份，再下载并核验来源与缺失。"
+policy:
+  allow_implicit_invocation: true
