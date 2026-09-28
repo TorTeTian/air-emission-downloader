@@ -11,7 +11,8 @@ import os
 from pathlib import Path
 import unittest
 
-from air_extract import extract_air, summarize_jja
+from air_extract import extract_air, summarize_period, requested_rows
+from time_selection import select_time
 
 
 def report(rows, period="2024年06月", typ="月报", quarter=2, section="airMainEmission"):
@@ -23,7 +24,15 @@ def pollutant(value="1", code="A21002", name="氮氧化物", outlet="DA001", **e
 
 
 def extract(body, rid="r1", **meta):
-    return extract_air(body, dict(report_id=rid, **meta), {"enterprise_id": "E1", "permit_code": "P1"})
+    # Historical summer cases are an explicitly selected regression sample.
+    # General all-season and native-total coverage is in test_time_selection.py.
+    rows = extract_air(body, dict(report_id=rid, **meta), {"enterprise_id": "E1", "permit_code": "P1"})
+    return [r for r in rows if r["period_kind"] != "quarter" and (r["month"] is None or r["month"] in (6, 7, 8))]
+
+
+def summarize_sample(rows):
+    years = sorted({r["year"] for r in rows if r.get("year") is not None})
+    return summarize_period(rows, select_time(years=years, months=[6, 7, 8]))
 
 
 class ExtractionTests(unittest.TestCase):
@@ -40,8 +49,8 @@ class ExtractionTests(unittest.TestCase):
         self.assertAlmostEqual(sum(row["value"] for row in records if row["month"] == 7 and row["scope"] == "main_outlet"), 304.38)
         self.assertAlmostEqual(sum(row["value"] for row in records if row["month"] == 8 and row["scope"] == "main_outlet"), 265.03)
         self.assertEqual([row["value"] for row in records if row["scope"] == "enterprise_total"], [0, 0])
-        self.assertEqual(len(summarize_jja(records)), 6)
-        self.assertTrue(all(item["jja"] is None for item in summarize_jja(records)))
+        self.assertEqual(len(summarize_sample(records)), 6)
+        self.assertTrue(all(item["period_total"] is None for item in summarize_sample(records)))
 
     def test_nantong_2024_june_real_values(self):
         original = report([pollutant(value, outlet=outlet) for outlet, value in [("DA001", "/"), ("DA002", "/"), ("DA003", "8.778"), ("DA004", "11.812")]])
@@ -62,8 +71,8 @@ class ExtractionTests(unittest.TestCase):
         original = report([dict(pollutantCode="A21002", pollutantName="氮氧化物", outletCode="DA002", firstMonth="1.6", secondMonth="0.88", thirdMonth="0", total="2.48")], "2023年第03季", "季报", 3)
         records = extract(original)
         self.assertEqual([(row["month"], row["value"]) for row in records], [(7, 1.6), (8, 0.88)])
-        self.assertEqual(summarize_jja(records)[0]["missing_months"], [6])
-        self.assertIsNone(summarize_jja(records)[0]["jja"])
+        self.assertEqual(summarize_sample(records)[0]["missing_periods"], ["2023-06"])
+        self.assertIsNone(summarize_sample(records)[0]["period_total"])
 
     def test_lossless_cross_industry_and_input_unchanged(self):
         body = report([pollutant("1", code="A20057", name="汞及其化合物"), pollutant("2", code="CUSTOM", name="未知指标")])
@@ -74,7 +83,7 @@ class ExtractionTests(unittest.TestCase):
         self.assertEqual(body, old)
         self.assertEqual(records[1]["unit_status"], "unknown")
         self.assertEqual(records[1]["raw_row"], body["emissionInfo"]["airMainEmission"][1])
-        self.assertFalse(records[3]["jja_eligible"])
+        self.assertFalse(records[3]["aggregation_eligible"])
         json.dumps(records, ensure_ascii=False, allow_nan=False)
 
     def test_units_and_blackness(self):
@@ -82,8 +91,8 @@ class ExtractionTests(unittest.TestCase):
         records = extract(body)
         self.assertEqual([row["unit"] for row in records], ["kg", None, "dimensionless", None, "kg", "mg/m3"])
         self.assertEqual(records[4]["unit_status"], "conflict")
-        self.assertFalse(records[2]["jja_eligible"])
-        self.assertFalse(records[5]["jja_eligible"])
+        self.assertFalse(records[2]["aggregation_eligible"])
+        self.assertFalse(records[5]["aggregation_eligible"])
         strict = extract(report([pollutant()]), allow_template_mass_unit=False)[0]
         self.assertIsNone(strict["unit"])
 
@@ -93,7 +102,7 @@ class ExtractionTests(unittest.TestCase):
         self.assertEqual(records[0]["report_id"], "public123")
         self.assertIn("permit_code_mismatch", records[0]["identity_conflicts"])
         self.assertTrue(records[1]["pollutant_identity_conflict"])
-        self.assertFalse(records[0]["jja_eligible"])
+        self.assertFalse(records[0]["aggregation_eligible"])
 
     def test_quarter_mapping_never_uses_total_or_output(self):
         body = report([dict(pollutantCode="A21002", pollutantName="NOx", outletCode="D", firstMonth="5", secondMonth="6", thirdMonth="/", thirdMonthOutput="100", total="0")], "2024年第2季", "季报", 2)
@@ -108,7 +117,8 @@ class ExtractionTests(unittest.TestCase):
         self.assertEqual(records[0]["field"], "total")
         self.assertEqual(records[0]["value"], 12)
         self.assertIsNone(records[0]["month"])
-        self.assertEqual(summarize_jja(records), [])
+        self.assertFalse(summarize_sample(records)[0]["complete"])
+        self.assertIsNone(summarize_sample(records)[0]["period_total"])
 
     def test_collector_metadata_and_period_identity(self):
         metadata = {"report_id": "r1", "report_type": "month", "report_period": "2024年6月月报表", "permit_code": "P1", "official_public_url": "https://example.invalid/public", "public_template_unit": "public air table in tonnes"}
@@ -120,7 +130,7 @@ class ExtractionTests(unittest.TestCase):
         body["companyInfo"]["reportTime"] = "2024年07月"
         row = extract_air(body, metadata, {})[0]
         self.assertIn("report_period_mismatch", row["identity_conflicts"])
-        self.assertFalse(row["jja_eligible"])
+        self.assertFalse(row["aggregation_eligible"])
         body.pop("companyInfo")
         row = extract_air(body, metadata, {})[0]
         self.assertEqual((row["year"], row["month"]), (2024, 6))
@@ -149,8 +159,8 @@ class SummaryTests(unittest.TestCase):
     def test_complete_decimal_and_month_priority(self):
         rows = self.monthly(6, "0.1") + self.monthly(7, "0.2") + self.monthly(8, "0.3")
         rows += extract(report([dict(pollutantCode="A21002", pollutantName="NOx", outletCode="DA001", firstMonth="9", secondMonth="9")], "2024年第3季", "季报", 3), "quarter")
-        summary = summarize_jja(rows)[0]
-        self.assertEqual(summary["jja_decimal"], "0.6")
+        summary = summarize_sample(rows)[0]
+        self.assertEqual(summary["period_total_decimal"], "0.6")
         self.assertTrue(summary["complete"])
         self.assertEqual(summary["months"][1]["selected_priority"], "month")
         self.assertTrue(summary["months"][1]["lower_priority_disagreement"])
@@ -159,30 +169,30 @@ class SummaryTests(unittest.TestCase):
     def test_revision_conflict_blocks_without_quarter_fallback(self):
         rows = self.monthly(6, "1") + self.monthly(7, "2", "old") + self.monthly(7, "3", "new") + self.monthly(8, "4")
         rows += extract(report([dict(pollutantCode="A21002", pollutantName="NOx", outletCode="DA001", firstMonth="3", secondMonth="4")], "2024年第3季", "季报", 3), "quarter")
-        summary = summarize_jja(rows)[0]
-        self.assertEqual(summary["conflict_months"], [7])
-        self.assertIsNone(summary["jja"])
+        summary = summarize_sample(rows)[0]
+        self.assertEqual(summary["conflict_periods"], ["2024-07"])
+        self.assertIsNone(summary["period_total"])
 
     def test_equal_revision_sources_retained(self):
         rows = self.monthly(6, "1") + self.monthly(7, "2", "old") + self.monthly(7, "2.0", "new") + self.monthly(8, "3")
-        summary = summarize_jja(rows)[0]
-        self.assertEqual(summary["jja"], 6)
+        summary = summarize_sample(rows)[0]
+        self.assertEqual(summary["period_total"], 6)
         self.assertEqual(len(summary["months"][1]["selected_sources"]), 2)
 
     def test_duplicate_scope_rows_even_equal_are_ambiguous(self):
         rows = self.monthly(6, "1") + self.monthly(8, "3")
         rows += extract(report([pollutant("2"), pollutant("2")], "2024年07月"), "duplicate")
-        summary = summarize_jja(rows)[0]
+        summary = summarize_sample(rows)[0]
         self.assertIn("duplicate_scope_rows", summary["months"][1]["conflict_reasons"])
         self.assertFalse(summary["complete"])
 
     def test_unknown_units_and_mixed_units_not_added(self):
         rows = self.monthly(6, "1", unit="吨") + self.monthly(7, "1000", unit="kg") + self.monthly(8, "1", unit="吨")
-        summary = summarize_jja(rows)
+        summary = summarize_sample(rows)
         self.assertEqual({item["unit"] for item in summary}, {"t", "kg"})
-        self.assertTrue(all(item["jja"] is None for item in summary))
+        self.assertTrue(all(item["period_total"] is None for item in summary))
         unknown = sum((self.monthly(m, "1", name="未知指标", code="X") for m in (6, 7, 8)), [])
-        self.assertIsNone(summarize_jja(unknown)[0]["jja"])
+        self.assertIsNone(summarize_sample(unknown)[0]["period_total"])
 
     def test_scope_permit_outlet_and_pollutant_code_separation(self):
         rows = []
@@ -192,9 +202,9 @@ class SummaryTests(unittest.TestCase):
             rows += extract(body, f"p1-{month}")
             body["companyInfo"]["permitCode"] = "P2"
             rows += extract_air(body, {"report_id": f"p2-{month}"}, {"enterprise_id": "E1", "permit_code": "P2"})
-        summaries = summarize_jja(rows)
+        summaries = summarize_sample(rows)
         self.assertEqual(len(summaries), 6)
-        self.assertEqual(sorted(item["jja"] for item in summaries), [3, 3, 6, 6, 9, 9])
+        self.assertEqual(sorted(item["period_total"] for item in summaries), [3, 3, 6, 6, 9, 9])
 
 
 @unittest.skipUnless(os.environ.get("MEE_AIR_TEST_MANIFEST"), "optional real public-report cache manifest not supplied")
@@ -209,7 +219,9 @@ class RealCacheTests(unittest.TestCase):
                 continue
             with self.subTest(report=identity):
                 body = json.loads(Path(item["path"]).read_text(encoding="utf-8"))
-                rows = extract_air(body, item, {"enterprise_id": item["case"], "permit_code": item["permit"]})
+                all_rows = extract_air(body, item, {"enterprise_id": item["case"], "permit_code": item["permit"]})
+                selection = select_time(years=[int(item["report"][:4])], months=[6, 7, 8])
+                rows = [r for r in requested_rows(all_rows, selection) if r["period_kind"] == "month"]
                 factor = 2 if body["companyInfo"]["reportQuarter"] == 3 else 1
                 expected = sum(len(value) for key, value in body["emissionInfo"].items() if key.startswith("air") and isinstance(value, list)) * factor
                 self.assertEqual(len(rows), expected)

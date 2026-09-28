@@ -12,7 +12,8 @@ import requests
 from bs4 import BeautifulSoup
 from Crypto.Cipher import AES
 from Crypto.Util.Padding import unpad
-from air_extract import extract_air,summarize_jja
+from air_extract import extract_air,requested_rows,summarize_period,summarize_native_periods
+from time_selection import time_from_args,relevant_report,report_period
 
 BASE='https://permit.mee.gov.cn'
 SEARCH=BASE+'/perxxgkinfo/syssb/xkgg/xkgg!licenseInformation.action'
@@ -20,7 +21,7 @@ REGIONS=BASE+'/perxxgkinfo/syssb/xkgg/xkgg!getRegions.action'
 INDEX=BASE+'/perxxgkinfo/syssb/wysb/hpsp/hpsp-company-sewage!getZxbgByYear.action'
 VIEW=BASE+'/permitrep/report/'
 BODY=VIEW+'repShare/pdf/getReportInfo'
-VERSION='1.0.0'
+VERSION='2.0.0'
 
 def now(): return datetime.now(timezone.utc).isoformat()
 def digest(b): return hashlib.sha256(b).hexdigest()
@@ -171,12 +172,6 @@ def discover(net,args):
  save(net.out/'discovery.json',ledger);save(net.out/'enterprises.json',selected);csv_save(net.out/'enterprises.csv',selected)
  return selected,ledger
 
-def is_jja(r,year):
- t=str(r.get('reportTime',''))
- if not t.startswith(str(year)):return False
- if '月' in t:return bool(re.search(r'年0?[678]月',t))
- return bool(re.search(r'第0?[23]季',t))
-
 def viewer_script(net):
  h=net.html('GET',VIEW);sp=BeautifulSoup(h,'html.parser')
  sources=[urljoin(VIEW,s['src']) for s in sp.select('script[src]') if '/assets/index-' in s['src']]
@@ -238,46 +233,52 @@ def get_body(net,r,ent,secret):
  save(mp,meta);return air,meta
 
 def collect(net,args,ents,discovery):
+ selection=time_from_args(args)
  manifest=[];indices=[];allrows=[];secret=None
  # Initialize this run even when zero enterprises or zero relevant reports.
  save(net.out/'report_manifest.json',manifest);save(net.out/'index_coverage.json',indices)
  for ent in ents:
-  for year in args.years:
+  for year in selection['years']:
    rs=net.json('POST',INDEX,data={'reportYear':str(year),'dataid':ent['enterprise_id']})
    if not isinstance(rs,list):raise StopRun('Report index schema changed')
    save(net.out/'indices'/f"{ent['enterprise_id']}_{year}.json",rs)
-   relevant=[r for r in rs if is_jja(r,year)]
-   indices.append({'enterprise_id':ent['enterprise_id'],'permit_code':ent['permit_code'],'year':year,'index_reports':len(rs),'jja_reports':len(relevant),'status':'ok'})
+   try:relevant=[r for r in rs if relevant_report(r,selection,year)]
+   except ValueError as e:raise StopRun(str(e)) from e
+   indices.append({'enterprise_id':ent['enterprise_id'],'permit_code':ent['permit_code'],'year':year,'index_reports':len(rs),'relevant_reports':len(relevant),'requested_periods':[p for p in selection['periods'] if p.startswith(str(year))],'status':'ok'})
    for r in relevant:
-    entry={'enterprise_id':ent['enterprise_id'],'permit_code':ent['permit_code'],'period':r.get('reportTime'),'source_url':r.get('docUrl')}
+    entry={'enterprise_id':ent['enterprise_id'],'permit_code':ent['permit_code'],'period':r.get('reportTime'),'source_url':r.get('docUrl'),'report_coverage':report_period(r)}
     try:
      if secret is None:secret=viewer_script(net)
      body,meta=get_body(net,r,ent,secret)
-     extracted=extract_air(body,meta,ent);allrows.extend(extracted)
+     extracted=requested_rows(extract_air(body,meta,ent),selection);allrows.extend(extracted)
      entry.update(meta,status='downloaded',extracted_rows=len(extracted))
     except UnsupportedPublicFormat as e:entry.update(status='unsupported_or_invalid',error=str(e))
     manifest.append(entry);save(net.out/'report_manifest.json',manifest)
    save(net.out/'index_coverage.json',indices)
- summary=summarize_jja(allrows)
- save(net.out/'air_monthly_rows.json',allrows);csv_save(net.out/'air_monthly_rows.csv',allrows)
- save(net.out/'jja_summary.json',summary)
- if isinstance(summary,list):csv_save(net.out/'jja_summary.csv',summary)
- coverage={'mode':args.mode,'years':args.years,'months':[6,7,8],'enterprises':len(ents),'indexes_completed':len(indices),
+ monthly=[r for r in allrows if r.get('period_kind')=='month']
+ native=[r for r in allrows if r.get('period_kind') in {'quarter','year'}]
+ summary=summarize_period(allrows,selection)
+ native_summary=summarize_native_periods(native,selection)
+ for name,records in [('air_records',allrows),('air_monthly_rows',monthly),('air_native_period_rows',native),('period_summary',summary),('native_period_summary',native_summary)]:
+  save(net.out/(name+'.json'),records);csv_save(net.out/(name+'.csv'),records)
+ coverage={'mode':args.mode,'time_selection':selection,'enterprises':len(ents),'indexes_completed':len(indices),
    'reports_requested':len(manifest),'reports_downloaded':sum(m['status']=='downloaded' for m in manifest),
-   'reports_unsupported':sum(m['status']!='downloaded' for m in manifest),'air_monthly_rows':len(allrows),
-   'jja_groups':len(summary),'jja_complete_groups':sum(g.get('complete',False) for g in summary),
-   'jja_conflict_groups':sum(g.get('status')=='conflict' for g in summary),
+   'reports_unsupported':sum(m['status']!='downloaded' for m in manifest),'air_monthly_rows':len(monthly),'air_native_period_rows':len(native),
+   'period_groups':len(summary),'period_complete_groups':sum(g.get('complete',False) for g in summary),
+   'period_conflict_groups':sum(g.get('status')=='conflict' for g in summary),
    'monthly_vs_quarterly_disagreement_groups':sum(any(m.get('lower_priority_disagreement',False) for m in g.get('months',[])) for g in summary),
-   'jja_incomplete_groups':sum(not g.get('complete',False) for g in summary),
-   'monthly_missing_or_invalid_rows':sum(r.get('value') is None for r in allrows),
+   'period_incomplete_groups':sum(not g.get('complete',False) for g in summary),
+   'native_period_groups':len(native_summary),'native_exact_request_groups':sum(g['status']=='selected' and g['exactly_matches_request'] for g in native_summary),
+   'monthly_missing_or_invalid_rows':sum(r.get('value') is None for r in monthly),
    'unknown_or_conflicting_unit_rows':sum(r.get('unit_status') in ['unknown','conflict'] for r in allrows),
    'network_calls_this_run':net.calls,
-   'report_acquisition_complete_for_selected':bool(ents) and len(indices)==len(ents)*len(args.years) and all(m['status']=='downloaded' for m in manifest),
+   'report_acquisition_complete_for_selected':bool(ents) and len(indices)==len(ents)*len(selection['years']) and all(m['status']=='downloaded' for m in manifest),
    'selected_identity_discovery_complete':discovery.get('discovery_complete',False),
    'geographic_completeness':(discovery.get('discovery_complete',False) and not discovery.get('report_sample_limited',False)) if args.mode=='region' else None,
    'historical_all_permit_enterprises_complete':False,
-   'caveats':['Current public catalog is not an archive of all 2023/2024 canceled or revoked permits.',
-    'No available monthly/quarterly source means missing, not zero. Annual and quarter totals are never prorated.',
+   'caveats':['Current public catalog is not an archive of all historical canceled or revoked permits.',
+    'Missing monthly sources are not zero. Native quarter/year totals are separate and never prorated or added to monthly sums.',
+    'Partial-month requests retain overlapping monthly reports but cannot produce an exact daily total.',
     'Whole-enterprise, main outlet, minor-group and fugitive-group amounts remain separate; not added together.',
     'No reported zero is silently corrected. Unknown units, conflicts and duplicate rows require review.']}
  save(net.out/'coverage.json',coverage);print(json.dumps(coverage,ensure_ascii=False,indent=2),flush=True)
@@ -286,25 +287,31 @@ def collect(net,args,ents,discovery):
 def compare_dirs(a,b,out):
  # Numeric/source identity equivalence, not date/cache-path equivalence.
  def records(p):
-  rr=load(Path(p)/'air_monthly_rows.json')
+  rr=load(Path(p)/'air_records.json')
   ignored={'access_utc','path','retrieved_at','download_path'}
   return sorted(canonical({k:v for k,v in r.items() if k not in ignored}) for r in rr)
  aa,bb=records(a),records(b)
  def reportset(p):return sorted((r['permit_code'],r.get('report_id',''),r.get('air_sha256','')) for r in load(Path(p)/'report_manifest.json') if r['status']=='downloaded')
- result={'compared_utc':now(),'left':str(a),'right':str(b),'left_rows':len(aa),'right_rows':len(bb),'monthly_records_equal':aa==bb,
+ result={'compared_utc':now(),'left':str(a),'right':str(b),'left_rows':len(aa),'right_rows':len(bb),'air_records_equal':aa==bb,
+         'time_selection_equal':load(Path(a)/'contract.json').get('time_selection')==load(Path(b)/'contract.json').get('time_selection'),
          'air_report_hashes_equal':reportset(a)==reportset(b),'left_only':list(set(aa)-set(bb))[:10],'right_only':list(set(bb)-set(aa))[:10]}
  result['nonempty_evidence']=bool(aa and bb and reportset(a) and reportset(b))
  result['left_status']=load(Path(a)/'run_status.json')
  result['right_status']=load(Path(b)/'run_status.json')
  result['both_runs_finished']=all(result[k].get('state')=='completed_with_declared_scope' for k in ['left_status','right_status'])
  save(out,result);print(json.dumps(result,ensure_ascii=False,indent=2))
- return 0 if result['nonempty_evidence'] and result['both_runs_finished'] and result['monthly_records_equal'] and result['air_report_hashes_equal'] else 2
+ return 0 if result['nonempty_evidence'] and result['both_runs_finished'] and result['air_records_equal'] and result['air_report_hashes_equal'] and result['time_selection_equal'] else 2
 
 def main():
  ap=argparse.ArgumentParser(description=__doc__);sub=ap.add_subparsers(dest='command',required=True)
  run=sub.add_parser('run');run.add_argument('--mode',choices=['region','company'],required=True)
  run.add_argument('--province');run.add_argument('--city');run.add_argument('--county');run.add_argument('--name');run.add_argument('--permit')
- run.add_argument('--years',type=int,nargs='+',default=[2023,2024]);run.add_argument('--out',required=True)
+ run.add_argument('--years',type=int,nargs='+',help='Explicit years; all 12 months unless --months is supplied')
+ run.add_argument('--months',type=int,nargs='+',help='Calendar months 1..12 for each specified year')
+ run.add_argument('--start',help='Inclusive start YYYY-MM or YYYY-MM-DD; use with --end')
+ run.add_argument('--end',help='Inclusive end YYYY-MM or YYYY-MM-DD; use with --start')
+ run.add_argument('--periods',nargs='+',help='Explicit YYYY-MM values, including non-contiguous periods')
+ run.add_argument('--out',required=True)
  run.add_argument('--max-pages',type=int,default=1,help='0 means all, subject to request budget')
  run.add_argument('--max-details',type=int,default=10,help='0 means all')
  run.add_argument('--limit-companies',type=int,default=0)
@@ -318,15 +325,18 @@ def main():
  if a.mode=='region' and (not a.province or not a.city or not a.county or a.name or a.permit):ap.error('Region requires province/city/county, and prohibits name/permit narrowing')
  if a.mode=='company' and not (a.name or a.permit):ap.error('Company requires exact name or permit')
  if any(v<0 for v in [a.max_pages,a.max_details,a.limit_companies,a.max_requests]):ap.error('Nonnegative limits required')
+ try:selection=time_from_args(a)
+ except (ValueError,TypeError) as e:ap.error(str(e))
  out=Path(a.out);out.mkdir(parents=True,exist_ok=True)
- contract={'version':VERSION,'created_utc':now(),'arguments':vars(a),'months':[6,7,8],
+ contract={'version':VERSION,'created_utc':now(),'arguments':vars(a),'time_selection':selection,
            'source':'MEE public permit platform','intended_scope':'air only; public current license catalog; explicit gaps for historic canceled entities',
-           'server_filters':['province','city','registerentername','xkznum'],'local_filters':['facility district','report year','JJA months'],
+           'server_filters':['province','city','registerentername','xkznum'],'local_filters':['facility district','requested reporting period overlap'],
            'stop_on':['budget','HTTP401/403/429','redirect','schema change','identity mismatch']}
  cp=out/'contract.json'
  if cp.exists():
-  prior=load(cp)['arguments']
-  for k in ['mode','province','city','county','name','permit','years']:
+  old=load(cp);prior=old['arguments']
+  if old.get('version')!=VERSION or old.get('time_selection')!=selection:ap.error('Output directory uses a different version or time window; use a new directory')
+  for k in ['mode','province','city','county','name','permit']:
    if prior.get(k)!=getattr(a,k):ap.error('Output directory belongs to a different query: '+k)
  save(cp,contract);net=Net(out,a.max_requests,a.delay)
  try:

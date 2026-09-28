@@ -1,12 +1,12 @@
 """Lossless, offline extraction of MEE public air-emission records.
 
 ``extract_air(body, report_meta, enterprise)`` emits every row in emissionInfo
-sections whose names start with ``air``. Monthly fields and the public Q2/Q3
-month columns are eligible for JJA. Annual/other-quarter totals are retained as
-audit records, never disaggregated. No network, file I/O, or third-party imports.
+sections whose names start with ``air``. All four quarters map their three
+monthly fields to calendar months. Native quarter/year totals are retained
+separately, never disaggregated. No network, file I/O, or third-party imports.
 
-``summarize_jja(rows)`` keeps enterprise totals and outlet/group scopes separate.
-It requires three usable months, uses monthly reports before quarterly reports,
+``summarize_period(rows, selection)`` keeps enterprise/outlet scopes separate.
+It requires every requested month, uses monthly reports before quarterly reports,
 and refuses conflicting revisions or ambiguous duplicate rows. Different raw
 pollutant codes and different physical units are intentionally not merged.
 """
@@ -274,10 +274,10 @@ def extract_air(body, report_meta=None, enterprise=None):
     typ, quarter, month = context["report_type"], context["report_quarter"], context["report_month"]
     if typ == "month":
         fields = [(month, "emitValue", "month")]
-    elif typ == "quarter" and quarter == 2:
-        fields = [(6, "thirdMonth", "month")]
-    elif typ == "quarter" and quarter == 3:
-        fields = [(7, "firstMonth", "month"), (8, "secondMonth", "month")]
+    elif typ == "quarter" and quarter in (1, 2, 3, 4):
+        fields = [(3 * quarter - 2 + i, field, "month")
+                  for i, field in enumerate(("firstMonth", "secondMonth", "thirdMonth"))]
+        fields.append((None, "total", "quarter"))
     elif typ in {"year", "quarter"}:
         fields = [(None, "total", typ)]
     else:
@@ -307,7 +307,9 @@ def extract_air(body, report_meta=None, enterprise=None):
                 warnings = section_warning + ([] if isinstance(raw_row, dict) else ["row_not_object"])
                 eligible = bool(value is not None and unit_info["unit_additive"] and pollutant_key
                                 and not pollutant_conflict and not context["identity_conflicts"]
-                                and period_kind == "month" and target_month in (6, 7, 8)
+                                and (period_kind == "month" and target_month in range(1, 13)
+                                     or period_kind == "quarter" and quarter in (1, 2, 3, 4)
+                                     or period_kind == "year")
                                 and context["year"] is not None and not warnings and not scope.startswith("unknown:"))
                 record = dict(context, **unit_info)
                 if not record["report_id"]:
@@ -325,7 +327,7 @@ def extract_air(body, report_meta=None, enterprise=None):
                     "json_pointer": base_pointer + ("/" + _pointer(field) if field else ""),
                     "row_json_pointer": base_pointer, "row_id": _text(row.get("id")),
                     "source_row_report_id": _text(row.get("reportId")), "remark": row.get("remark"),
-                    "raw_row": deepcopy(raw_row), "schema_warnings": warnings, "jja_eligible": eligible,
+                    "raw_row": deepcopy(raw_row), "schema_warnings": warnings, "aggregation_eligible": eligible,
                 })
                 result.append(record)
     return result
@@ -333,73 +335,121 @@ def extract_air(body, report_meta=None, enterprise=None):
 
 def _candidate(row):
     names = ("report_id", "report_type", "report_submit_time", "source_url", "json_pointer", "row_json_pointer", "row_id", "field",
-             "value_raw", "value", "value_decimal", "value_status", "unit", "unit_raw", "unit_source", "unit_status", "jja_eligible",
+             "value_raw", "value", "value_decimal", "value_status", "unit", "unit_raw", "unit_source", "unit_status", "aggregation_eligible",
              "identity_conflicts", "pollutant_identity_conflict", "schema_warnings")
     return {name: row.get(name) for name in names}
 
 
-def summarize_jja(rows):
-    """Return JJA groups and all month candidates; never sum across scopes.
+def _choose(candidates, monthly=True):
+    valid = [r for r in candidates if r.get("aggregation_eligible") and r.get("value_decimal") is not None]
+    preferred = [r for r in valid if r.get("report_type") == "month"] if monthly else valid
+    pool = preferred or ([r for r in valid if r.get("report_type") == "quarter"] if monthly else [])
+    unique = {}
+    for r in pool:
+        signature = (r.get("report_id"), r.get("source_url"), r.get("json_pointer"), r.get("value_decimal"))
+        unique.setdefault(signature, r)
+    pool = list(unique.values())
+    documents = {}
+    for r in pool:
+        document = r.get("report_id") or r.get("source_url") or r.get("source_row_report_id") or "unidentified_report"
+        documents.setdefault(document, set()).add(r.get("row_json_pointer"))
+    values = {Decimal(r["value_decimal"]) for r in pool}
+    duplicate = any(len(pointers) > 1 for pointers in documents.values())
+    conflict = len(values) > 1 or duplicate
+    selected = pool if len(values) == 1 and not conflict else []
+    value = next(iter(values)) if selected else None
+    return {
+        "status": "selected" if selected else "conflict" if conflict else "ineligible" if candidates else "missing",
+        "value": float(value) if value is not None else None,
+        "value_decimal": str(value) if value is not None else None,
+        "selected_priority": selected[0]["report_type"] if selected else None,
+        "conflict_reasons": (["same_priority_value_conflict"] if len(values) > 1 else []) + (["duplicate_scope_rows"] if duplicate else []),
+        "lower_priority_disagreement": bool(selected and any(Decimal(r["value_decimal"]) != value for r in valid)),
+        "selected_sources": [_candidate(r) for r in selected], "candidates": [_candidate(r) for r in candidates],
+    }
 
-    Values in different units or raw pollutant codes produce separate groups.
-    An unresolved conflict between valid monthly revisions blocks that month;
-    it does not fall through to a quarterly report. Annual rows cannot fill gaps.
+
+def row_periods(row):
+    year, month, quarter = row.get("year"), row.get("month"), row.get("report_quarter")
+    if year is None:
+        return []
+    if row.get("period_kind") == "month" and month in range(1, 13):
+        months = [month]
+    elif row.get("period_kind") == "quarter" and quarter in (1, 2, 3, 4):
+        months = range(3 * quarter - 2, 3 * quarter + 1)
+    elif row.get("period_kind") == "year":
+        months = range(1, 13)
+    else:
+        return []
+    return [f"{year:04d}-{m:02d}" for m in months]
+
+
+def requested_rows(rows, selection):
+    selected = set(selection["periods"])
+    # Keep unparseable records as audit rows, not as silently eligible values.
+    return [r for r in rows if not row_periods(r) or selected.intersection(row_periods(r))]
+
+
+def _group_key(row):
+    return (row.get("enterprise_id"), row.get("permit_code"), row.get("pollutant_key"),
+            row.get("scope"), row.get("outlet_code") or row.get("outlet_name") or "__group__", row.get("unit"))
+
+
+def _group_fields(row):
+    result = {name: row.get(name) for name in (
+        "enterprise_id", "enterprise_name", "permit_code", "pollutant_key", "pollutant_code", "pollutant_name",
+        "scope", "outlet_code", "outlet_name", "unit", "dimension")}
+    result["outlet_key"] = _group_key(row)[4]
+    return result
+
+
+def summarize_period(rows, selection):
+    """Sum only the explicitly selected full calendar months, including across years.
+
+    Native totals never fill missing monthly values or enter the same sum.
+    A partial-month date request can expose overlapping records, not an exact
+    daily total. No implicit season and no inferred missing-month zeroes.
     """
     groups = {}
-    for row in rows:
-        if row.get("period_kind") != "month" or row.get("month") not in (6, 7, 8):
-            continue
-        outlet_key = row.get("outlet_code") or row.get("outlet_name") or "__group__"
-        key = (row.get("enterprise_id"), row.get("permit_code"), row.get("pollutant_key"),
-               row.get("scope"), outlet_key, row.get("unit"), row.get("year"))
-        groups.setdefault(key, []).append(row)
+    for row in requested_rows(rows, selection):
+        groups.setdefault(_group_key(row), []).append(row)
     results = []
     for key, group in groups.items():
-        representative = group[0]
-        output = {name: representative.get(name) for name in (
-            "enterprise_id", "enterprise_name", "permit_code", "pollutant_key", "pollutant_code", "pollutant_name",
-            "scope", "outlet_code", "outlet_name", "unit", "dimension", "year")}
-        output["outlet_key"] = key[4]
-        months, selected_values = [], []
-        for month in (6, 7, 8):
-            candidates = [row for row in group if row["month"] == month]
-            valid = [row for row in candidates if row.get("jja_eligible") and row.get("value_decimal") is not None]
-            preferred = [row for row in valid if row.get("report_type") == "month"]
-            pool = preferred or [row for row in valid if row.get("report_type") == "quarter"]
-            unique_rows = {}
-            for row in pool:
-                signature = (row.get("report_id"), row.get("source_url"), row.get("json_pointer"), row.get("value_decimal"))
-                unique_rows.setdefault(signature, row)
-            pool = list(unique_rows.values())
-            documents = {}
-            for row in pool:
-                document = row.get("report_id") or row.get("source_url") or row.get("source_row_report_id") or "unidentified_report"
-                documents.setdefault(document, set()).add(row.get("row_json_pointer"))
-            values = {Decimal(row["value_decimal"]) for row in pool}
-            duplicate_rows = any(len(pointers) > 1 for pointers in documents.values())
-            conflict = len(values) > 1 or duplicate_rows
-            selected = pool if len(values) == 1 and not conflict else []
-            value = next(iter(values)) if selected else None
-            if value is not None:
-                selected_values.append(value)
-            status = "selected" if selected else "conflict" if conflict else "ineligible" if candidates else "missing"
-            entry = {
-                "month": month, "status": status, "value": float(value) if value is not None else None,
-                "value_decimal": str(value) if value is not None else None,
-                "selected_priority": selected[0]["report_type"] if selected else None,
-                "conflict_reasons": (["same_priority_value_conflict"] if len(values) > 1 else []) + (["duplicate_scope_rows"] if duplicate_rows else []),
-                "lower_priority_disagreement": bool(selected and any(Decimal(row["value_decimal"]) != value for row in valid)),
-                "selected_sources": [_candidate(row) for row in selected], "candidates": [_candidate(row) for row in candidates],
-            }
-            months.append(entry)
-        complete = len(selected_values) == 3
-        total = sum(selected_values, Decimal(0)) if complete else None
+        output = _group_fields(group[0])
+        months = []
+        for period in selection["periods"]:
+            candidates = [r for r in group if r.get("period_kind") == "month" and row_periods(r) == [period]]
+            months.append(dict(_choose(candidates), period=period, year=int(period[:4]), month=int(period[5:])))
+        covered = all(m["status"] == "selected" for m in months)
+        complete = covered and selection["whole_months"]
+        total = sum((Decimal(m["value_decimal"]) for m in months), Decimal(0)) if covered else None
         output.update({
-            "months": months, "complete": complete, "status": "complete" if complete else "conflict" if any(item["status"] == "conflict" for item in months) else "incomplete",
-            "jja": float(total) if total is not None else None, "jja_value": float(total) if total is not None else None,
-            "jja_decimal": str(total) if total is not None else None,
-            "missing_months": [item["month"] for item in months if item["status"] in {"missing", "ineligible"}],
-            "conflict_months": [item["month"] for item in months if item["status"] == "conflict"],
+            "requested_periods": selection["periods"], "requested_start": selection["requested_start"], "requested_end": selection["requested_end"],
+            "months": months, "month_coverage_complete": covered, "complete": complete,
+            "status": "complete" if complete else "conflict" if any(m["status"] == "conflict" for m in months) else "granularity_mismatch" if not selection["whole_months"] else "incomplete",
+            "period_total": float(total) if complete else None, "period_total_decimal": str(total) if complete else None,
+            "covered_full_months_total": float(total) if total is not None else None,
+            "missing_periods": [m["period"] for m in months if m["status"] in {"missing", "ineligible"}],
+            "conflict_periods": [m["period"] for m in months if m["status"] == "conflict"],
         })
         results.append(output)
-    return sorted(results, key=lambda item: json.dumps([item.get(name) for name in ("enterprise_id", "permit_code", "pollutant_key", "scope", "outlet_key", "unit", "year")], ensure_ascii=False))
+    return sorted(results, key=lambda item: json.dumps(_group_key(item), ensure_ascii=False))
+
+
+def summarize_native_periods(rows, selection):
+    """Resolve reported quarter/year totals separately, without disaggregation."""
+    groups = {}
+    selected = set(selection["periods"])
+    for row in rows:
+        periods = row_periods(row)
+        if row.get("period_kind") in {"quarter", "year"} and selected.intersection(periods):
+            groups.setdefault((_group_key(row), row["period_kind"], tuple(periods)), []).append(row)
+    result = []
+    for (_, kind, periods), candidates in groups.items():
+        entry = dict(_group_fields(candidates[0]), **_choose(candidates, monthly=False))
+        entry.update(period_kind=kind, covered_periods=list(periods),
+                     fully_within_requested_months=selection["whole_months"] and set(periods).issubset(selected),
+                     exactly_matches_request=selection["whole_months"] and set(periods) == selected,
+                     aggregation_rule="Original reported total only; do not add to monthly totals or prorate.")
+        result.append(entry)
+    return sorted(result, key=lambda item: json.dumps([_group_key(item), item["period_kind"], item["covered_periods"]], ensure_ascii=False))

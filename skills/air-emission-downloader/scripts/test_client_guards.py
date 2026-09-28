@@ -216,7 +216,7 @@ class CollectionGuardTests(unittest.TestCase):
             indexes = json.loads((root / 'index_coverage.json').read_text(encoding='utf-8'))
             self.assertEqual(len(indexes), 1)
             self.assertEqual(indexes[0]['year'], 2023)
-            self.assertEqual(indexes[0]['jja_reports'], 0)
+            self.assertEqual(indexes[0]['relevant_reports'], 0)
             self.assertEqual(coverage['reports_requested'], 0)
 
 
