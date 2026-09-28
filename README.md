@@ -4,22 +4,22 @@
 
 |用户要求|选择|
 |---|---|
-|常熟市所有持证企业2024年第四季度记录|按地区：官方地市目录 → 生产经营场所县区核验|
-|江苏常熟发电有限公司2023年11月至2024年2月记录|按企业：名称/许可证检索 → 精确身份核验|
+|指定地区内所有持证企业在指定时间段的记录|按地区：官方地市目录 → 生产经营场所县区核验|
+|指定企业在指定时间段的记录|按企业：名称/许可证检索 → 精确身份核验|
 
 ## 安装与调用
 
 将`skills/air-emission-downloader`复制到你的skill目录，例如Codex的`~/.codex/skills/air-emission-downloader`，新会话调用`$air-emission-downloader`。其他harness也可显式读取该文件夹的`SKILL.md`。
 
 ```text
-使用 $air-emission-downloader，获取江苏省苏州市常熟市2024年10—12月大气排污记录。
-先做首页前6个企业详情的小样本，最多40次请求，输出到E:/permit_air/changshu_pilot。
+使用 $air-emission-downloader，获取【省】【市】【县/区】在【起始时间】至【结束时间】的大气排污记录。
+先做首页前6个企业详情的小样本，最多40次请求，输出到E:/permit_air/region_pilot。
 不启动全量，核验来源、单位、缺失和覆盖范围。
 ```
 
 ```text
-使用 $air-emission-downloader，获取江苏常熟发电有限公司2023年11月至2024年2月大气排污记录。
-输出到E:/permit_air/changshu_power，最多40次请求。核对许可证与场址，
+使用 $air-emission-downloader，获取【企业全称或许可证号】在【起始时间】至【结束时间】的大气排污记录。
+输出到E:/permit_air/company_records，最多40次请求。核对许可证与场址，
 保留全部大气指标以及全厂/排口口径，完成后运行来源回读核验。
 ```
 
